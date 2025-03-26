@@ -12,12 +12,207 @@ import pytesseract
 import base64
 import io
 import gc
+import shutil
+import subprocess
+import glob
+import tempfile
 from datetime import datetime, timedelta
 from PIL import Image, ImageOps
 from flask import Flask, request, jsonify, send_file, session
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from collections import defaultdict, OrderedDict
+
+# Fungsi untuk memeriksa instalasi Poppler
+def check_poppler_installation():
+    """Periksa instalasi Poppler dan tampilkan info berguna untuk debugging"""
+    logger.info("===== CHECKING POPPLER INSTALLATION =====")
+    
+    # Cek apakah executable ada di PATH
+    pdftoppm_path = shutil.which('pdftoppm')
+    
+    if pdftoppm_path:
+        logger.info(f"pdftoppm found in PATH: {pdftoppm_path}")
+        try:
+            result = subprocess.run(['pdftoppm', '-v'], capture_output=True, text=True)
+            logger.info(f"pdftoppm version: {result.stderr.strip()}")
+        except Exception as e:
+            logger.error(f"Error running pdftoppm: {e}")
+    else:
+        logger.warning("pdftoppm not found in PATH")
+        
+    # Cek di lokasi spesifik
+    poppler_locations = [
+        r'C:\Program Files\poppler\Library\bin',
+        r'C:\Program Files\poppler\bin',
+        r'C:\poppler\bin',
+        r'C:\Program Files (x86)\poppler\bin'
+    ]
+    
+    for location in poppler_locations:
+        logger.info(f"Checking {location}...")
+        pdftoppm_exe = os.path.join(location, 'pdftoppm.exe')
+        if os.path.exists(pdftoppm_exe):
+            logger.info(f"pdftoppm found at: {pdftoppm_exe}")
+            try:
+                result = subprocess.run([pdftoppm_exe, '-v'], capture_output=True, text=True)
+                logger.info(f"Version: {result.stderr.strip()}")
+            except Exception as e:
+                logger.error(f"Error running {pdftoppm_exe}: {e}")
+        else:
+            logger.warning(f"pdftoppm not found at {pdftoppm_exe}")
+    
+    # Periksa environment PATH
+    env_path = os.environ.get('PATH', '')
+    logger.info(f"Current PATH: {env_path}")
+    
+    # Periksa pdf2image
+    try:
+        import pdf2image
+        logger.info(f"pdf2image version: {pdf2image.__version__}")
+    except ImportError as e:
+        logger.error(f"pdf2image import error: {e}")
+    except Exception as e:
+        logger.error(f"Error checking pdf2image: {e}")
+    
+    logger.info("===== POPPLER CHECK FINISHED =====")
+
+# Fungsi untuk mendaftarkan Poppler ke environment PATH
+def register_poppler_path():
+    """
+    Mendaftarkan path Poppler ke environment PATH
+    """
+    import os
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    # Path Poppler yang diketahui
+    poppler_paths = [
+        r'C:\Program Files\poppler\Library\bin',  # Lokasi instalasi saat ini
+        r'C:\Program Files\poppler\bin',          # Lokasi standar
+        r'C:\Program Files (x86)\poppler\bin',
+        r'C:\poppler\bin',
+        # Tambahkan path lain sesuai kebutuhan
+    ]
+    
+    # Periksa path yang ada
+    for path in poppler_paths:
+        if os.path.exists(path):
+            # Cek apakah pdftoppm ada di lokasi tersebut
+            if os.path.exists(os.path.join(path, 'pdftoppm.exe')):
+                logger.info(f"Menemukan Poppler di: {path}")
+                
+                # Tambahkan ke PATH environment
+                if path not in os.environ['PATH']:
+                    os.environ['PATH'] = path + os.pathsep + os.environ['PATH']
+                    logger.info(f"Menambahkan {path} ke PATH environment")
+                    
+                return path
+            else:
+                logger.warning(f"Path {path} ada, tapi tidak berisi pdftoppm.exe")
+    
+    logger.warning("Tidak dapat menemukan Poppler di path yang diketahui!")
+    return None
+
+# Ekstrak halaman PDF menggunakan subprocess
+def extract_pdf_page_with_subprocess(pdf_path, page_num):
+    """
+    Ekstrak halaman PDF menggunakan subprocess langsung ke pdftoppm.
+    
+    Args:
+        pdf_path: Path ke file PDF
+        page_num: Nomor halaman yang ingin diekstrak (dimulai dari 0)
+    
+    Returns:
+        Path ke file gambar hasil, jumlah halaman total
+    """
+    logger.info(f"Mencoba ekstrak PDF dengan subprocess langsung")
+    
+    # Cek jumlah halaman dulu dengan pdfinfo
+    try:
+        pdfinfo_exe = r'C:\Program Files\poppler\Library\bin\pdfinfo.exe'
+        if not os.path.exists(pdfinfo_exe):
+            pdfinfo_exe = 'pdfinfo'  # coba gunakan dari PATH
+            
+        result = subprocess.run([pdfinfo_exe, pdf_path], 
+                               capture_output=True, text=True, check=False)
+        
+        if result.returncode != 0:
+            logger.error(f"pdfinfo error: {result.stderr}")
+            # Fallback ke PyPDF2
+            from PyPDF2 import PdfReader
+            pdf = PdfReader(pdf_path)
+            total_pages = len(pdf.pages)
+        else:
+            # Parse output dari pdfinfo
+            output = result.stdout
+            pages_line = [line for line in output.split('\n') if 'Pages:' in line]
+            if pages_line:
+                total_pages = int(pages_line[0].split('Pages:')[1].strip())
+            else:
+                total_pages = 0
+                
+        logger.info(f"PDF memiliki {total_pages} halaman (dari pdfinfo)")
+    except Exception as e:
+        logger.error(f"Error saat mendapatkan jumlah halaman: {e}")
+        total_pages = 0
+    
+    # Cek validitas nomor halaman
+    if page_num is not None and (page_num < 0 or page_num >= total_pages):
+        return None, total_pages
+    
+    # Create temporary directory
+    temp_dir = tempfile.mkdtemp()
+    output_prefix = os.path.join(temp_dir, "page")
+    
+    try:
+        # Path ke pdftoppm
+        pdftoppm_exe = r'C:\Program Files\poppler\Library\bin\pdftoppm.exe'
+        if not os.path.exists(pdftoppm_exe):
+            pdftoppm_exe = 'pdftoppm'  # coba gunakan dari PATH
+        
+        # Jalankan pdftoppm untuk mengkonversi halaman PDF ke JPG
+        cmd = [
+            pdftoppm_exe,
+            "-jpeg",
+            "-r", "200"  # 200 DPI untuk kualitas yang baik
+        ]
+        
+        # Tambahkan range halaman jika ada
+        if page_num is not None:
+            cmd.extend(["-f", str(page_num + 1), "-l", str(page_num + 1)])
+        else:
+            # Default hanya halaman pertama
+            cmd.extend(["-f", "1", "-l", "1"])
+            
+        # Tambahkan input dan output
+        cmd.extend([pdf_path, output_prefix])
+        
+        logger.info(f"Menjalankan command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        
+        if result.returncode != 0:
+            logger.error(f"pdftoppm error: {result.stderr}")
+            return None, total_pages
+        
+        # Cari file output
+        output_files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) 
+                       if f.startswith(os.path.basename(output_prefix)) and f.endswith(".jpg")]
+        
+        if not output_files:
+            logger.error(f"Tidak ada file yang dihasilkan di {temp_dir}")
+            return None, total_pages
+            
+        # Urutkan file (meskipun seharusnya hanya ada satu)
+        output_files.sort()
+        
+        logger.info(f"Berhasil menghasilkan {len(output_files)} file: {output_files}")
+        return output_files[0], total_pages
+        
+    except Exception as e:
+        logger.error(f"Error saat mengkonversi PDF: {e}")
+        return None, total_pages
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -420,72 +615,207 @@ def extract_text_from_pdf(pdf_path, language='eng', page_num=None):
     """
     start_time = time.time()
     
-    try:
-        from pdf2image import convert_from_path
-        
-        # Get total page count
-        from PyPDF2 import PdfReader
-        pdf = PdfReader(pdf_path)
-        total_pages = len(pdf.pages)
-        
-        # Determine which pages to process
-        if page_num is not None:
-            # Process only specific page
-            if page_num < 0 or page_num >= total_pages:
-                return f"Invalid page number. PDF has {total_pages} pages.", 0, 0, total_pages
-                
-            pages = convert_from_path(pdf_path, 200, first_page=page_num+1, last_page=page_num+1)
-            page_range = [page_num]
-        else:
-            # For initial call, process only first page to be fast
-            pages = convert_from_path(pdf_path, 200, first_page=1, last_page=1)
-            page_range = [0]
-        
-        # Process each page
-        texts = []
-        total_confidence = 0
-        confidence_count = 0
-        
-        for i, page in enumerate(pages):
-            # Save page as image
-            page_path = f"{pdf_path}_page_{page_range[i]}.jpg"
-            page.save(page_path, 'JPEG')
-            
-            # Optimize image for mobile
-            optimized_path = optimize_image_for_mobile(page_path)
-            
-            # Process image
-            processed_path = preprocess_image(optimized_path, 'balanced')
-            
-            # OCR page
-            text, _, confidence = perform_ocr(processed_path, language)
-            texts.append(text)
-            
-            # Add confidence
-            if confidence > 0:
-                total_confidence += confidence
-                confidence_count += 1
-            
-            # Remove temporary files
-            try:
-                os.remove(page_path)
-                if optimized_path != page_path:
-                    os.remove(optimized_path)
-                if processed_path != optimized_path:
-                    os.remove(processed_path)
-            except:
-                pass
-        
-        # Combine results
-        full_text = "\n\n".join(texts)
-        avg_confidence = total_confidence / confidence_count if confidence_count > 0 else 0
-        processing_time = time.time() - start_time
-        
-        return full_text, processing_time, avg_confidence, total_pages
+    # DEBUGGING: Tampilkan PATH saat ini
+    logger.info(f"Current PATH: {os.environ.get('PATH', '')}")
     
+    try:
+        # Coba mendapatkan jumlah halaman dengan PyPDF2 terlebih dahulu
+        try:
+            from PyPDF2 import PdfReader
+            pdf = PdfReader(pdf_path)
+            total_pages = len(pdf.pages)
+            logger.info(f"PDF memiliki {total_pages} halaman berdasarkan PyPDF2")
+        except Exception as e:
+            logger.error(f"Error membaca PDF dengan PyPDF2: {e}")
+            total_pages = 0
+        
+        # Coba ekstrak teks langsung dari PDF jika memungkinkan
+        extracted_text = ""
+        if total_pages > 0:
+            try:
+                # Ekstrak teks langsung dari PDF jika halaman tertentu diminta
+                if page_num is not None and 0 <= page_num < total_pages:
+                    page = pdf.pages[page_num]
+                    direct_text = page.extract_text()
+                    if direct_text and len(direct_text.strip()) > 50:  # Jika teks cukup bermakna
+                        logger.info(f"Berhasil mengekstrak teks langsung dari PDF halaman {page_num}")
+                        return direct_text, time.time() - start_time, 90.0, total_pages
+                else:
+                    # Jika tidak ada halaman tertentu, coba ekstrak dari halaman pertama
+                    page = pdf.pages[0]
+                    direct_text = page.extract_text()
+                    if direct_text and len(direct_text.strip()) > 50:
+                        logger.info("Berhasil mengekstrak teks langsung dari PDF halaman pertama")
+                        return direct_text, time.time() - start_time, 90.0, total_pages
+            except Exception as e:
+                logger.warning(f"Tidak dapat mengekstrak teks langsung dari PDF: {e}")
+        
+        # Coba konversi PDF ke gambar dengan pdf2image
+        try:
+            from pdf2image import convert_from_path
+            
+            # PENDEKATAN 1: Gunakan path langsung ke executable Poppler
+            pdftoppm_path = r'C:\Program Files\poppler\Library\bin\pdftoppm.exe'
+            pdfinfo_path = r'C:\Program Files\poppler\Library\bin\pdfinfo.exe'
+            
+            if os.path.exists(pdftoppm_path) and os.path.exists(pdfinfo_path):
+                poppler_path = os.path.dirname(pdftoppm_path)
+                logger.info(f"Menggunakan Poppler dari path langsung: {poppler_path}")
+                
+                # Tambahkan poppler ke PATH env khusus untuk proses ini
+                if poppler_path not in os.environ['PATH']:
+                    os.environ['PATH'] = poppler_path + os.pathsep + os.environ['PATH']
+                    logger.info(f"PATH diupdate: {os.environ['PATH']}")
+                
+                # Tentukan halaman yang akan diproses
+                if page_num is not None:
+                    # Proses hanya halaman tertentu
+                    if page_num < 0 or page_num >= total_pages:
+                        return f"Nomor halaman tidak valid. PDF memiliki {total_pages} halaman.", 0, 0, total_pages
+                        
+                    # Coba dengan opsi lengkap untuk diagnostik
+                    try:
+                        logger.info(f"Mencoba konversi PDF dengan path poppler: {poppler_path}")
+                        pages = convert_from_path(
+                            pdf_path, 
+                            200, 
+                            first_page=page_num+1, 
+                            last_page=page_num+1, 
+                            poppler_path=poppler_path,
+                            use_pdftocairo=False,  # Gunakan pdftoppm (lebih stabil di Windows)
+                            strict=False           # Mode tidak strict
+                        )
+                        logger.info("Berhasil mengkonversi PDF ke gambar")
+                    except Exception as conv_error:
+                        logger.error(f"Error konversi dengan opsi lengkap: {conv_error}")
+                        
+                        # PENDEKATAN 2: Coba dengan subprocess langsung
+                        try:
+                            logger.info("Mencoba konversi dengan subprocess langsung")
+                            import subprocess
+                            import tempfile
+                            
+                            # Buat direktori temporary
+                            temp_dir = tempfile.mkdtemp()
+                            output_file = os.path.join(temp_dir, "page")
+                            
+                            # Jalankan pdftoppm langsung
+                            cmd = [pdftoppm_path, "-jpeg", "-f", str(page_num+1), "-l", str(page_num+1), 
+                                  "-r", "200", pdf_path, output_file]
+                            logger.info(f"Menjalankan command: {' '.join(cmd)}")
+                            
+                            result = subprocess.run(cmd, capture_output=True, text=True)
+                            if result.returncode != 0:
+                                logger.error(f"pdftoppm error: {result.stderr}")
+                                raise Exception(f"pdftoppm failed: {result.stderr}")
+                                
+                            # Cari file output
+                            output_files = [f for f in os.listdir(temp_dir) if f.startswith("page") and f.endswith(".jpg")]
+                            if not output_files:
+                                raise Exception("No output files generated")
+                                
+                            # Load gambar hasil
+                            from PIL import Image
+                            pages = [Image.open(os.path.join(temp_dir, f)) for f in output_files]
+                            logger.info(f"Berhasil konversi dengan subprocess: {len(pages)} halaman")
+                            
+                        except Exception as sub_error:
+                            logger.error(f"Error konversi dengan subprocess: {sub_error}")
+                            
+                            # PENDEKATAN 3: Coba tanpa menentukan poppler_path
+                            try:
+                                logger.info("Mencoba konversi tanpa poppler_path")
+                                pages = convert_from_path(pdf_path, 200, first_page=page_num+1, last_page=page_num+1)
+                                logger.info("Berhasil konversi tanpa poppler_path")
+                            except Exception as e:
+                                logger.error(f"Semua metode konversi gagal: {e}")
+                                return f"Gagal mengkonversi PDF: {str(e)}. Coba pastikan Poppler terinstal dengan benar.", time.time() - start_time, 0, total_pages
+                else:
+                    # Untuk panggilan awal, proses hanya halaman pertama agar cepat
+                    try:
+                        logger.info(f"Mencoba konversi PDF halaman awal dengan path poppler: {poppler_path}")
+                        pages = convert_from_path(
+                            pdf_path, 
+                            200, 
+                            first_page=1, 
+                            last_page=1, 
+                            poppler_path=poppler_path,
+                            use_pdftocairo=False
+                        )
+                    except Exception as e:
+                        logger.error(f"Error konversi halaman awal: {e}")
+                        pages = convert_from_path(pdf_path, 200, first_page=1, last_page=1)
+                
+                page_range = [page_num] if page_num is not None else [0]
+            else:
+                logger.warning(f"File pdftoppm tidak ditemukan di {pdftoppm_path}")
+                pages = convert_from_path(pdf_path, 200, first_page=1, last_page=1)
+                page_range = [0]
+            
+            # Proses setiap halaman
+            texts = []
+            total_confidence = 0
+            confidence_count = 0
+            
+            for i, page in enumerate(pages):
+                # Simpan halaman sebagai gambar
+                page_path = f"{pdf_path}_page_{page_range[i]}.jpg"
+                page.save(page_path, 'JPEG')
+                
+                # Optimasi gambar untuk mobile
+                optimized_path = optimize_image_for_mobile(page_path)
+                
+                # Proses gambar
+                processed_path = preprocess_image(optimized_path, 'balanced')
+                
+                # OCR halaman
+                text, _, confidence = perform_ocr(processed_path, language)
+                texts.append(text)
+                
+                # Tambahkan confidence
+                if confidence > 0:
+                    total_confidence += confidence
+                    confidence_count += 1
+                
+                # Hapus file temporary
+                try:
+                    os.remove(page_path)
+                    if optimized_path != page_path:
+                        os.remove(optimized_path)
+                    if processed_path != optimized_path:
+                        os.remove(processed_path)
+                except:
+                    pass
+            
+            # Gabungkan hasil
+            full_text = "\n\n".join(texts)
+            avg_confidence = total_confidence / confidence_count if confidence_count > 0 else 0
+            processing_time = time.time() - start_time
+            
+            return full_text, processing_time, avg_confidence, total_pages
+            
+        except ImportError as import_err:
+            logger.error(f"pdf2image tidak tersedia: {import_err}")
+            # Jika PDF berhasil dibaca dengan PyPDF2, ekstrak teks sebagai fallback
+            if total_pages > 0:
+                try:
+                    if page_num is not None and 0 <= page_num < total_pages:
+                        extracted_text = pdf.pages[page_num].extract_text()
+                    else:
+                        # Ekstrak dari semua halaman
+                        extracted_text = ""
+                        for i in range(min(total_pages, 5)):  # Batasi ke 5 halaman pertama
+                            extracted_text += pdf.pages[i].extract_text() + "\n\n"
+                    
+                    return extracted_text, time.time() - start_time, 70.0, total_pages
+                except Exception as inner_e:
+                    logger.error(f"Gagal mengekstrak teks dengan PyPDF2: {inner_e}")
+            
+            return "Tidak dapat memproses PDF. Pastikan pdf2image dan poppler terinstal dengan benar.", time.time() - start_time, 0, total_pages
+            
     except Exception as e:
-        logger.error(f"Error during PDF extraction: {e}")
-        # Try to determine page count even if extraction fails
+        logger.error(f"Error selama ekstraksi PDF: {e}")
+        # Coba tentukan jumlah halaman meski ekstraksi gagal
         try:
             from PyPDF2 import PdfReader
             pdf = PdfReader(pdf_path)
@@ -493,7 +823,7 @@ def extract_text_from_pdf(pdf_path, language='eng', page_num=None):
         except:
             total_pages = 0
             
-        return str(e), time.time() - start_time, 0, total_pages
+        return f"Error saat memproses PDF: {str(e)}\nPastikan Poppler terinstal dan berfungsi dengan benar.", time.time() - start_time, 0, total_pages
 
 def analyze_document_structure(image_path):
     """
@@ -708,10 +1038,26 @@ def health_check():
     """Health check endpoint"""
     try:
         version = pytesseract.get_tesseract_version()
+        
+        # Check Poppler
+        try:
+            pdftoppm_path = r'C:\Program Files\poppler\Library\bin\pdftoppm.exe'
+            if not os.path.exists(pdftoppm_path):
+                pdftoppm_path = shutil.which('pdftoppm')
+                
+            if pdftoppm_path:
+                poppler_version = subprocess.run([pdftoppm_path, '-v'], 
+                                               capture_output=True, text=True).stderr.strip()
+            else:
+                poppler_version = "Not found"
+        except Exception as e:
+            poppler_version = f"Error checking: {str(e)}"
+            
         return jsonify({
             "status": "success",
             "message": "OCR API is healthy",
             "tesseract_version": str(version),
+            "poppler_version": poppler_version,
             "active_sessions": len(SESSION_CACHE)
         })
     except Exception as e:
@@ -876,12 +1222,49 @@ def analyze_document(session_id):
     try:
         # Process based on file type
         if file_data["is_pdf"]:
-            # PDF processing
-            text, processing_time, confidence, total_pages = extract_text_from_pdf(
-                file_data["filepath"], 
-                file_data["language"],
-                page
-            )
+            # PDF processing - coba dengan dua metode
+            try:
+                # Coba dengan extract_text_from_pdf dulu
+                text, processing_time, confidence, total_pages = extract_text_from_pdf(
+                    file_data["filepath"], 
+                    file_data["language"],
+                    page
+                )
+                
+                # Jika berhasil (tidak mengandung error message)
+                if not text.startswith("Error") and not text.startswith("Tidak dapat") and not text.startswith("Gagal"):
+                    logger.info("Berhasil ekstrak PDF dengan extract_text_from_pdf")
+                else:
+                    # Jika gagal, coba dengan subprocess
+                    logger.info("Mencoba metode alternatif dengan subprocess")
+                    image_path, total_pages = extract_pdf_page_with_subprocess(file_data["filepath"], page)
+                    
+                    if image_path:
+                        # Berhasil mengkonversi ke gambar, lakukan OCR
+                        processed_path = preprocess_image(image_path, 'balanced')
+                        text, proc_time, confidence = perform_ocr(processed_path, file_data["language"])
+                        processing_time = proc_time
+                        
+                        # Hapus file temporary
+                        try:
+                            if os.path.exists(image_path):
+                                os.remove(image_path)
+                            if processed_path != image_path and os.path.exists(processed_path):
+                                os.remove(processed_path)
+                        except Exception as e:
+                            logger.error(f"Error menghapus file temporary: {e}")
+                    else:
+                        # Kedua metode gagal, berikan pesan error
+                        return jsonify({
+                            "status": "error",
+                            "message": "Gagal memproses PDF dengan kedua metode. Pastikan Poppler terinstal dengan benar."
+                        }), 500
+            except Exception as pdf_error:
+                logger.error(f"Kedua metode ekstraksi PDF gagal: {pdf_error}")
+                return jsonify({
+                    "status": "error",
+                    "message": f"Error saat memproses PDF: {str(pdf_error)}"
+                }), 500
             
             # Update file data
             if "pages" not in file_data:
@@ -899,21 +1282,30 @@ def analyze_document(session_id):
             # Perform structure analysis if requested
             if full_analysis:
                 # For PDFs, we need to extract the page first
-                from pdf2image import convert_from_path
-                pages = convert_from_path(
-                    file_data["filepath"], 
-                    200, 
-                    first_page=page+1, 
-                    last_page=page+1
-                )
-                
-                if pages:
-                    # Save page as image
-                    temp_path = f"{file_data['filepath']}_page_{page}.jpg"
-                    pages[0].save(temp_path, 'JPEG')
-                    
-                    # Analyze structure
-                    structure = analyze_document_structure(temp_path)
+                try:
+                    # Gunakan hasil konversi dari subprocess jika ada
+                    if 'image_path' in locals() and image_path:
+                        # Analyze structure pada gambar yang sudah dikonversi
+                        structure = analyze_document_structure(image_path)
+                    else:
+                        # Coba ekstrak ulang dengan subprocess
+                        image_path, _ = extract_pdf_page_with_subprocess(file_data["filepath"], page)
+                        if image_path:
+                            structure = analyze_document_structure(image_path)
+                        else:
+                            # Fallback jika gagal
+                            structure = {
+                                "suggested_actions": [
+                                    {
+                                        "type": "read_full",
+                                        "description": "Read full text"
+                                    },
+                                    {
+                                        "type": "summarize",
+                                        "description": "Read summary of text"
+                                    }
+                                ]
+                            }
                     
                     # Store analysis results
                     file_data["pages"][page]["structure"] = structure
@@ -921,7 +1313,8 @@ def analyze_document(session_id):
                     
                     # Clean up
                     try:
-                        os.remove(temp_path)
+                        if 'image_path' in locals() and image_path and os.path.exists(image_path):
+                            os.remove(image_path)
                     except:
                         pass
                         
@@ -936,7 +1329,8 @@ def analyze_document(session_id):
                         "processing_time_ms": processing_time * 1000,
                         "structure": structure
                     }
-                else:
+                except Exception as struct_error:
+                    logger.error(f"Error saat analisis struktur: {struct_error}")
                     response = {
                         "status": "success",
                         "file_id": file_id,
@@ -978,7 +1372,7 @@ def analyze_document(session_id):
             session_data["current"]["column"] = 0
             
         else:
-            # Image processing
+            # Image processing (kode asli tidak berubah)
             if not file_data.get("processed"):
                 # Preprocess image
                 processed_path = preprocess_image(file_data["filepath"], 'balanced')
@@ -1113,11 +1507,33 @@ def navigate_document(session_id):
             # Check if page data exists
             if new_page != current_page or new_page not in file_data.get("pages", {}):
                 # Need to process the page
-                text, processing_time, confidence, _ = extract_text_from_pdf(
-                    file_data["filepath"], 
-                    file_data["language"],
-                    new_page
-                )
+                try:
+                    # Coba dengan extract_text_from_pdf dulu
+                    text, processing_time, confidence, _ = extract_text_from_pdf(
+                        file_data["filepath"], 
+                        file_data["language"],
+                        new_page
+                    )
+                    
+                    # Jika hasil tidak memuaskan, coba dengan subprocess
+                    if text.startswith("Error") or text.startswith("Tidak dapat") or text.startswith("Gagal"):
+                        image_path, _ = extract_pdf_page_with_subprocess(file_data["filepath"], new_page)
+                        if image_path:
+                            processed_path = preprocess_image(image_path, 'balanced')
+                            text, processing_time, confidence = perform_ocr(processed_path, file_data["language"])
+                            
+                            # Hapus file temporary
+                            try:
+                                os.remove(image_path)
+                                if processed_path != image_path:
+                                    os.remove(processed_path)
+                            except:
+                                pass
+                except Exception as e:
+                    logger.error(f"Error saat memproses halaman baru: {e}")
+                    text = f"Error memproses halaman {new_page}: {str(e)}"
+                    processing_time = 0
+                    confidence = 0
                 
                 # Save page data
                 if "pages" not in file_data:
@@ -1159,41 +1575,36 @@ def navigate_document(session_id):
                 page = current["page"]
                 if page not in file_data.get("pages", {}) or not file_data["pages"][page].get("analyzed"):
                     # Need to analyze page structure
-                    from pdf2image import convert_from_path
-                    pages = convert_from_path(
-                        file_data["filepath"], 
-                        200, 
-                        first_page=page+1, 
-                        last_page=page+1
-                    )
-                    
-                    if pages:
-                        # Save page as image
-                        temp_path = f"{file_data['filepath']}_page_{page}.jpg"
-                        pages[0].save(temp_path, 'JPEG')
+                    try:
+                        # Coba ekstrak halaman dengan subprocess
+                        image_path, _ = extract_pdf_page_with_subprocess(file_data["filepath"], page)
                         
-                        # Analyze structure
-                        structure = analyze_document_structure(temp_path)
-                        
-                        # Store analysis results
-                        if "pages" not in file_data:
-                            file_data["pages"] = {}
+                        if image_path:
+                            # Analyze structure pada gambar yang dikonversi
+                            structure = analyze_document_structure(image_path)
                             
-                        if page not in file_data["pages"]:
-                            file_data["pages"][page] = {}
+                            # Store analysis results
+                            if "pages" not in file_data:
+                                file_data["pages"] = {}
+                                
+                            if page not in file_data["pages"]:
+                                file_data["pages"][page] = {}
+                                
+                            file_data["pages"][page]["structure"] = structure
+                            file_data["pages"][page]["analyzed"] = True
                             
-                        file_data["pages"][page]["structure"] = structure
-                        file_data["pages"][page]["analyzed"] = True
-                        
-                        # Clean up
-                        try:
-                            os.remove(temp_path)
-                        except:
-                            pass
-                            
-                        paragraphs = structure.get("paragraphs", [])
-                    else:
-                        # Fallback if page extraction fails
+                            # Clean up
+                            try:
+                                os.remove(image_path)
+                            except:
+                                pass
+                                
+                            paragraphs = structure.get("paragraphs", [])
+                        else:
+                            # Fallback jika ekstraksi gagal
+                            paragraphs = []
+                    except Exception as e:
+                        logger.error(f"Error saat ekstraksi halaman untuk navigasi paragraf: {e}")
                         paragraphs = []
                 else:
                     # Use cached structure
@@ -1494,7 +1905,7 @@ def summarize_document(session_id):
                 text = "\n\n".join([page_data.get("text", "") 
                                    for page_data in file_data["pages"].values()])
             else:
-                # For images, use full text
+# For images, use full text
                 if not file_data.get("processed"):
                     return jsonify({
                         "status": "error",
@@ -1743,6 +2154,16 @@ def get_languages():
 
 # Main execution
 if __name__ == '__main__':
+    # Periksa instalasi Poppler
+    check_poppler_installation()
+    
+    # Daftarkan Poppler ke environment PATH
+    poppler_path = register_poppler_path()
+    if poppler_path:
+        logger.info(f"Berhasil mendaftarkan Poppler dari: {poppler_path}")
+    else:
+        logger.warning("Tidak dapat menemukan Poppler. Fungsi PDF mungkin tidak berfungsi dengan baik.")
+    
     # Clean up the upload folder at startup
     for file in os.listdir(UPLOAD_FOLDER):
         try:
